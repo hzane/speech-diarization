@@ -28,17 +28,15 @@ class Segment:
     score: float | None = None
 
 
-def diar_read_audio(path_wav: str | np.ndarray, sr: int = 16000, lufs: float = -18.0):
+def diar_read_audio(path_wav: str | tuple[np.ndarray, int], sr: int = 16000, lufs: float = -18.0):
     if isinstance(path_wav, (str, Path)):
         wav, sr = librosa.load(path_wav, sr=sr, mono=True, res_type="kaiser_fast")  # type: ignore
     else:
-        wav, sr = path_wav, sr
+        wav, orig_sr = path_wav
+        if orig_sr != sr:
+            wav = librosa.resample(wav, orig_sr=orig_sr, target_sr=sr, res_type="kaiser_fast")
 
     wav = loudness_normalize(wav, sr, target_lufs=lufs)
-
-    if sr != 16000:
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=16000, res_type="kaiser_fast")
-        sr = 16000
 
     wav = librosa.to_mono(wav)
     wav = wav - np.mean(wav)
@@ -334,7 +332,7 @@ def frame_reassign(
     if not segs:
         return segs
     spk_ids = sorted(list(set(s.spk for s in segs if s.spk is not None)))
-    centroids: Dict[int, np.ndarray] = {}
+    centroids: dict[int, np.ndarray] = {}
     for sid in spk_ids:
         vecs = []
         for s in segs:
@@ -431,40 +429,10 @@ def merge_adjacent(segs: List[Segment], gap: float = 0.05) -> List[Segment]:
 #         return []
 
 
-def save_json(path: str, segs: List[Segment]):
-    data = {
-        "segments": [
-            {
-                "start": round(s.start, 3),
-                "end": round(s.end, 3),
-                "speaker": int(s.spk) if s.spk is not None else None,
-            }
-            for s in segs
-        ],
-        "num_speakers": len(set([s.spk for s in segs if s.spk is not None])),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def save_srt(path: str, segs: List[Segment]):
-    def fmt(ts: float) -> str:
-        h = int(ts // 3600)
-        ts -= h * 3600
-        m = int(ts // 60)
-        ts -= m * 60
-        s = int(ts)
-        ms = int(round((ts - s) * 1000))
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    with open(path, "w", encoding="utf-8") as f:
-        for i, s in enumerate(segs, 1):
-            f.write(f"{i}\n{fmt(s.start)} --> {fmt(s.end)}\nSPK_{s.spk}\n\n")
-
 
 # 主流程
 def diarize(
-    wav_path: str,
+    wav_path: str|tuple[np.ndarray, int],
     sr: int = 16000,
     target_lufs: float = -18.0,
     vad_thr: float = 0.55,
@@ -481,7 +449,7 @@ def diarize(
     merge_mincos: float = 0.85,
     reseg: int = 1,
 ) -> list[Segment]:
-    y, sr = diar_read_audio(wav_path, sr)
+    y, sr = diar_read_audio(wav_path, sr, lufs = target_lufs)
 
     # 1) 短停顿友好的 VAD
     speech = using_silero_vad_segments(
