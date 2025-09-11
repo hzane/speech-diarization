@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import json
 import math
 import onnxruntime as ort
 import librosa
@@ -28,17 +27,21 @@ class Segment:
     score: float | None = None
 
 
-def diar_read_audio(path_wav: str | tuple[np.ndarray, int], sr: int = 16000, lufs: float = -18.0):
+def diar_read_audio(path_wav: str | tuple[np.ndarray, int], sr: int = 16000, lufs: float|None = -18.0):
     if isinstance(path_wav, (str, Path)):
         wav, sr = librosa.load(path_wav, sr=sr, mono=True, res_type="kaiser_fast")  # type: ignore
     else:
         wav, orig_sr = path_wav
+        if wav.ndim ==2 and wav.shape[1] <= 2:
+            wav = np.transpose(wav)
         if orig_sr != sr:
             wav = librosa.resample(wav, orig_sr=orig_sr, target_sr=sr, res_type="kaiser_fast")
 
-    wav = loudness_normalize(wav, sr, target_lufs=lufs)
-
     wav = librosa.to_mono(wav)
+
+    if lufs is not None:
+        wav = loudness_normalize(wav, sr, target_lufs=lufs)
+
     wav = wav - np.mean(wav)
     wav = librosa.effects.preemphasis(wav, coef=0.97)
     return wav.astype(np.float32), sr
@@ -68,11 +71,12 @@ def using_fbank(n_mels: int = 80, sample_rate: int = 16000, mean_nor: bool = Tru
         if mean_nor:
             feat = feat - feat.mean(0, keepdim=True)
 
-        feat = feat[:frames, :]
-        if frames and feat.shape[0] < frames:
-            feat = torch.nn.functional.pad(
-                feat, (0, 0, frames - feat.shape[0], 0), "constant", 0
-            )
+        if frames is not None:
+            feat = feat[:frames, :]
+            if frames and feat.shape[0] < frames:
+                feat = torch.nn.functional.pad(
+                    feat, (0, 0, frames - feat.shape[0], 0), "constant", 0
+                )
 
         return feat.unsqueeze(0).numpy()  # [1, T, n_mels]
 
@@ -87,8 +91,8 @@ def using_speaker_encoder(frames=None, num_mels: int = 80):
         onnx_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
     # 名称猜测（常见导出名），必要时打印 self._ort.get_inputs()
-    # self._in = self._ort.get_inputs()[0].name  # feature, ['batch_size', 'frame_num', 80]
-    # self._out = self._ort.get_outputs()[0].name # embedding, ['batch_size', 192]
+    # session.get_inputs()[0].name  # feature, ['batch_size', 'frame_num', 80]
+    # session.get_outputs()[0].name # embedding, ['batch_size', 192]
 
     def embed(wav: np.ndarray, sr: int = 16000) -> np.ndarray:
         assert len(wav.shape) == 1 and wav.dtype == np.float32 and sr == 16000
@@ -100,13 +104,14 @@ def using_speaker_encoder(frames=None, num_mels: int = 80):
     return embed
 
 
-# VAD：Silero + 去除那些持续时间极短的、被误判为语音的信号
+# VAD：Silero + 去除那些持续时间极短的、被误判为语音的信号j
+@lru_cache(maxsize=1)
 def using_silero_vad_segments(
-    threshold=0.55,
-    min_speech=0.15,
-    min_silence=0.10,
-    speech_pad=0.04,
-    bridge_ms=80.0,
+    threshold=0.5,
+    min_speech=0.15, # default 250
+    min_silence=0.10, # 100
+    speech_pad=0.04, # 30
+    bridge_ms=80,
     hop_s: float = 0.01,
     min_segment_duration_s: float = 0.05,
 ) -> Callable[[np.ndarray, int], list[Segment]]:
@@ -115,6 +120,7 @@ def using_silero_vad_segments(
         "silero_vad",
         onnx=False,
         force_reload=False,
+        skip_validation=True,
     )  # type: ignore
     get_speech_timestamps = utils[0]
 
@@ -135,7 +141,7 @@ def using_silero_vad_segments(
                 threshold=threshold,
                 min_speech_duration_ms=int(min_speech * 1000),
                 min_silence_duration_ms=int(min_silence * 1000),
-                window_size_samples=512,
+                # window_size_samples=512,
                 speech_pad_ms=int(speech_pad * 1000),
             )
         if not speech_timestamps:
@@ -198,6 +204,7 @@ def scd_split_segments(
     step: float = 0.2,
     thr: float = 0.70,
 ) -> List[Segment]:
+    # 长语音段中，再根据音色变化进行二次切分
     assert len(y.shape) == 1 and y.dtype == np.float32 and sr == 16000
 
     out: List[Segment] = []
@@ -263,9 +270,11 @@ def embed_segments(y: np.ndarray, sr: int, segs: List[Segment]) -> np.ndarray:
     return np.vstack(embs)
 
 
-def cluster_by_threshold(embs: np.ndarray, cos_thr: float = 0.68) -> np.ndarray:
+def cluster_by_threshold(embs: np.ndarray, cos_thr: float = 0.6) -> np.ndarray:
     S = cosine_similarity(embs)
     D = 1 - S
+    print('emb-cosine', D.shape)
+
     clu = AgglomerativeClustering(
         n_clusters=None,
         linkage="average",
@@ -284,7 +293,7 @@ def conservative_merge(
     labels: np.ndarray,
     max_gap: float = 0.10,
     max_turn: float = 10.0,
-    min_cos: float = 0.85,
+    min_cos: float = 0.5,
 ) -> list[Segment]:
     merged: List[Segment] = []
     for i, seg in enumerate(segs):
@@ -299,7 +308,7 @@ def conservative_merge(
         eb = using_speaker_encoder()(bw, sr)
         return float(np.dot(ea, eb) / (np.linalg.norm(ea) * np.linalg.norm(eb) + 1e-8))
 
-    for seg in segs:
+    for seg in track(segs, description="[magenta]Embedding segments"):
         if not merged:
             merged.append(seg)
             continue
@@ -352,6 +361,7 @@ def frame_reassign(
         e = int(sm.end / hop)
         smask[s:e] = True
 
+    print('max-t', max_t)
     times, out_labels, t = [], [], 0.0
     while t < max_t:
         idx = int(t / hop)
@@ -377,6 +387,7 @@ def frame_reassign(
         times.append(t)
         t += smooth_step
 
+    print('out-labels', len(out_labels))
     refined: List[Segment] = []
     cur_sid, s_t = None, None
     for t, sid in list(zip(times, out_labels)) + [(max_t, -999)]:
@@ -385,6 +396,7 @@ def frame_reassign(
                 refined.append(Segment(s_t, t, cur_sid))
             cur_sid, s_t = sid, t
 
+    print('refined', len(refined))
     final: List[Segment] = []
     for r in refined:
         if r.spk is None or r.spk < 0:
@@ -401,6 +413,7 @@ def frame_reassign(
 
 
 def merge_adjacent(segs: List[Segment], gap: float = 0.05) -> List[Segment]:
+    print('merge-adjacent', len(segs))
     segs = sorted(segs, key=lambda s: (s.start, s.end))
     out: List[Segment] = []
     for s in segs:
@@ -438,15 +451,15 @@ def diarize(
     vad_thr: float = 0.55,
     min_speech: float = 0.15,
     min_silence: float = 0.10,
-    speech_pad: float = 0.04,
+    speech_pad: float = 0.07,
     morph_bridge_ms: float = 80.0,
     scd_win: float = 0.8,
     scd_step: float = 0.2,
-    scd_thr: float = 0.70,
-    cluster_cos: float = 0.68,
-    merge_gap: float = 0.10,
+    scd_thr: float = 1.50,
+    cluster_cos: float = 0.35,
+    merge_gap: float = .5,
     merge_maxturn: float = 10.0,
-    merge_mincos: float = 0.85,
+    merge_mincos: float = 0.37,
     reseg: int = 1,
 ) -> list[Segment]:
     y, sr = diar_read_audio(wav_path, sr, lufs = target_lufs)
@@ -464,12 +477,16 @@ def diarize(
 
     # 2) 段内 SCD
     speech2 = scd_split_segments(y, sr, speech, win=scd_win, step=scd_step, thr=scd_thr)
+    print('segments',len(speech), len(speech2))
 
     # 3) 嵌入 + 聚类
     embs = embed_segments(y, sr, speech2)
+    print('embeddings', embs.shape)
+
     labels = cluster_by_threshold(embs, cos_thr=cluster_cos)
     for s, lab in zip(speech2, labels):
         s.spk = int(lab)
+    print('cluster', labels)
 
     # 4) 防粘连合并
     speech3 = conservative_merge(
@@ -484,13 +501,14 @@ def diarize(
 
     # 5) 帧级重分配
     if reseg:
-        speech4 = frame_reassign(y, sr, speech, speech3, smooth_step=0.10, win=0.50)
+        speech4 = frame_reassign(y, sr, speech, speech3, smooth_step=0.10, win=1.0)
     else:
         speech4 = speech3
 
     # overlaps = detect_overlap_pyannote(wav_path)
     # meta = {"overlaps": [{"start": o.start, "end": o.end} for o in overlaps]}
     final = merge_adjacent(speech4, gap=0.05)
+    print('final', len(final))
     return final
 
 
@@ -505,11 +523,11 @@ def main(
     morph_bridge_ms: float = 80.0,
     scd_win: float = 0.8,
     scd_step: float = 0.2,
-    scd_thr: float = 0.70,
-    cluster_cos: float = 0.68,
-    merge_gap: float = 0.10,
+    scd_thr: float = 1.2,
+    cluster_cos: float = 0.65,
+    merge_gap: float = 0.25,
     merge_maxturn: float = 10.0,
-    merge_mincos: float = 0.85,
+    merge_mincos: float = 0.7,
     reseg: int = 1,
 ):
     print(f"[bold]Loading:[/bold] {wav_path}")

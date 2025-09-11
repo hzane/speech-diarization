@@ -23,6 +23,9 @@ COLORS = [
 
 def gradio_numpy_audio(audio_input: tuple[int, np.ndarray]):
     sr, y = audio_input
+    if y.ndim ==2 :
+        y = y[:, 0]
+
     y = y.astype(np.float32)/32768
     return y, sr
 
@@ -74,6 +77,7 @@ def run_diarize(
             }
         )
     df = pd.DataFrame(rows)
+    print('dataframe', df.shape)
 
     # 绘图（波形 + 着色）
     # 注意：这里用 librosa 的波形作背景，着色使用 axvspan
@@ -91,10 +95,8 @@ def run_diarize(
     ax.set_ylabel("Amplitude")
     ax.set_title("Waveform with diarization spans")
     plt.tight_layout()
-
-    # JSON 文本（便于复制）
-    json_text = df.to_json(orient="records", force_ascii=False)
-    return fig, df, json_text
+    print('here')
+    return fig, df
 
 
 def build_ui():
@@ -117,26 +119,25 @@ def build_ui():
             with gr.Row():
                 scd_win = gr.Slider(0.4, 1.5, 0.8, step=0.05, label="SCD 滑窗(s)")
                 scd_step = gr.Slider(0.05, 0.6, 0.2, step=0.01, label="SCD 步长(s)")
-                scd_thr = gr.Slider(0.3, 1.5, 0.70, step=0.01, label="SCD 峰值阈(z)")
+                scd_thr = gr.Slider(0.3, 2, 1.20, step=0.01, label="SCD 峰值阈(z)")
                 reseg = gr.Checkbox(value=True, label="帧级重分配（更细边界）")
             with gr.Row():
                 cluster_cos = gr.Slider(
-                    0.5, 0.9, 0.68, step=0.01, label="聚类相似阈(余弦)"
+                    0.15, 0.9, 0.65, step=0.01, label="聚类相似阈(余弦)"
                 )
                 merge_gap = gr.Slider(
-                    0.01, 0.5, 0.10, step=0.01, label="合并允许间隙(s)"
+                    0.01, 10.5, .75, step=0.01, label="合并允许间隙(s)"
                 )
                 merge_maxturn = gr.Slider(
                     2.0, 30.0, 10.0, step=0.5, label="同人最长连续(s)"
                 )
                 merge_mincos = gr.Slider(
-                    0.6, 0.99, 0.85, step=0.01, label="跨缝最小相似度"
+                    0.1, 0.99, 0.75, step=0.01, label="跨缝最小相似度"
                 )
 
         btn = gr.Button("运行")
         fig = gr.Plot(label="波形与分段")
         table = gr.Dataframe(label="Segments", interactive=False)
-        jtxt = gr.Textbox(label="Segments JSON", lines=6)
 
         btn.click(
             fn=run_diarize,
@@ -155,7 +156,7 @@ def build_ui():
                 merge_mincos,
                 reseg,
             ],
-            outputs=[fig, table, jtxt],
+            outputs=[fig, table],
         )
     return demo
 
