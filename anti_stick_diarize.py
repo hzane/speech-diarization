@@ -14,7 +14,8 @@ from sklearn.cluster import AgglomerativeClustering
 
 from rich import print
 from rich.progress import track
-from scipy.ndimage import binary_opening
+from scipy.ndimage import binary_closing
+from scipy.signal import find_peaks
 from pathlib import Path
 from functools import lru_cache
 
@@ -58,62 +59,53 @@ def loudness_normalize(
     return np.clip(y, -0.99, 0.99)
 
 
-def using_fbank(n_mels: int = 80, sample_rate: int = 16000, mean_nor: bool = True):
-    def fbank(wav, frames: int | None = None, dither=0) -> np.ndarray:
-        assert len(wav.shape) == 2 and wav.shape[0] == 1
+def fbank_batch(wavs: np.ndarray, # [B, n_samples]
+                sr: int = 16000, n_mels: int = 80, mean_nor: bool = True,
+                dither:float = 0)->np.ndarray:
+    assert wavs.ndim == 2
 
-        feat = Kaldi.fbank(
-            torch.from_numpy(wav),
-            num_mel_bins=n_mels,
-            sample_frequency=sample_rate,
-            dither=dither,
-        )  # [T, n_mels]
-        if mean_nor:
-            feat = feat - feat.mean(0, keepdim=True)
+    feat = Kaldi.fbank(
+        torch.from_numpy(wavs),
+        num_mel_bins=n_mels,
+        sample_frequency=sr,
+        dither=dither,
+    )  # [B, T, n_mels]
+    if mean_nor:
+        feat = feat - feat.mean(1, keepdim=True)
 
-        if frames is not None:
-            feat = feat[:frames, :]
-            if frames and feat.shape[0] < frames:
-                feat = torch.nn.functional.pad(
-                    feat, (0, 0, frames - feat.shape[0], 0), "constant", 0
-                )
+    return feat.numpy()  # [1, T, n_mels]
 
-        return feat.unsqueeze(0).numpy()  # [1, T, n_mels]
 
-    return fbank
 
 
 @lru_cache(maxsize=1)
-def using_speaker_encoder(frames=None, num_mels: int = 80):
+def using_speaker_encoder(num_mels: int = 80):
     # iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common
     onnx_path = "models/iic-speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common.onnx"
     session = ort.InferenceSession(
         onnx_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
-    # 名称猜测（常见导出名），必要时打印 self._ort.get_inputs()
-    # session.get_inputs()[0].name  # feature, ['batch_size', 'frame_num', 80]
-    # session.get_outputs()[0].name # embedding, ['batch_size', 192]
 
-    def embed(wav: np.ndarray, sr: int = 16000) -> np.ndarray:
-        assert len(wav.shape) == 1 and wav.dtype == np.float32 and sr == 16000
+    def batch(wavs: np.ndarray, sr: int = 16000) -> np.ndarray:
+        assert wavs.ndim == 2
 
-        features = using_fbank(num_mels, sr, mean_nor=True)(wav[None, :], frames=frames)
+        features = fbank_batch(wavs, sr = sr, n_mels=num_mels, mean_nor=True)
         y = session.run(None, dict(feature=features))[0]
-        return y.squeeze(0)  # [1, 192] #type: ignore
+        return y.squeeze(0)  # [B, 192] #type: ignore
 
-    return embed
+    return batch
 
 
 # VAD：Silero + 去除那些持续时间极短的、被误判为语音的信号j
 @lru_cache(maxsize=1)
 def using_silero_vad_segments(
     threshold=0.5,
-    min_speech=0.15, # default 250
+    min_speech=0.25, # default 250
     min_silence=0.10, # 100
     speech_pad=0.04, # 30
     bridge_ms=80,
     hop_s: float = 0.01,
-    min_segment_duration_s: float = 0.05,
+    min_segment_duration_s: float = 0.10,
 ) -> Callable[[np.ndarray, int], list[Segment]]:
     model, utils = torch.hub.load(
         "snakers4/silero-vad",
@@ -157,7 +149,7 @@ def using_silero_vad_segments(
         # 应用形态学操作
         bridge_frames = max(1, int(round((bridge_ms / 1000.0) / hop_s)))
         structure = np.ones(bridge_frames, dtype=bool)
-        processed_mask = binary_opening(mask, structure=structure)
+        processed_mask = binary_closing(mask, structure=structure) # or binary_opening
 
         # 性 能优化：使用NumPy将掩码转换回时间戳
         processed_mask = np.concatenate(([False], processed_mask, [False]))
@@ -180,34 +172,36 @@ def using_silero_vad_segments(
 # SCD：段内变更检测（滑窗嵌入 + 峰值）
 def sliding_windows(
     start: float, end: float, win: float, step: float
-) -> List[Tuple[float, float]]:
-    t, out = start, []
-    while t + win <= end + 1e-9:
-        out.append((t, t + win))
-        t += step
-    return out
+) -> np.ndarray:
+    if end < start + win:
+        return np.empty((0, 2), dtype=np.float32)
+
+    starts = np.arange(start, end - win + 1e-9, step)
+    ends = starts + win
+
+    return np.vstack((starts, ends)).T # (N, 2)
 
 
 def local_peaks_1d(x: np.ndarray, thr: float) -> List[int]:
-    peaks = []
-    for i in range(1, len(x) - 1):
-        if x[i] > thr and x[i] > x[i - 1] and x[i] > x[i + 1]:
-            peaks.append(i)
-    return peaks
+    peak_indices, _ = find_peaks(x, height=thr)
+    return peak_indices.tolist()
 
 
 def scd_split_segments(
     y: np.ndarray,
     sr: int,
-    segments: List[Segment],
+    segments: list[Segment],
     win: float = 0.8,
     step: float = 0.2,
-    thr: float = 0.70,
+    thr: float = 1.25,
 ) -> List[Segment]:
     # 长语音段中，再根据音色变化进行二次切分
-    assert len(y.shape) == 1 and y.dtype == np.float32 and sr == 16000
+    assert y.ndim == 1 and y.dtype == np.float32 and sr == 16000
 
     out: List[Segment] = []
+    win_samples = int(win * sr)
+    min_win_samples = int(step * sr*0.8)
+
     for seg in track(segments, description="[cyan]SCD splitting"):
         if seg.end - seg.start < win * 1.5:
             out.append(seg)
