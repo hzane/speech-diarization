@@ -3,6 +3,7 @@ import numpy as np
 import onnxruntime as ort
 from torchaudio.transforms import MelSpectrogram
 from speechbrain.inference.classifiers import EncoderClassifier
+from pathlib import Path
 from functools import lru_cache
 
 
@@ -40,8 +41,9 @@ def fbank_batch(wavs: np.ndarray, # [B, n_samples]
 
 @lru_cache(maxsize=1)
 def using_eres2netv2_encoder():
+    this_dir = Path(__file__).parent.resolve()
     # iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common
-    onnx_path = "models/iic-speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common.onnx"
+    onnx_path = this_dir / "models/iic-speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common.onnx"
     session = ort.InferenceSession(
         onnx_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
@@ -60,7 +62,7 @@ def eres2netv2_encode_batch(wavs: np.ndarray, sr: int = 16000, num_mels:int = 80
 
 
 @lru_cache(maxsize=1)
-def using_ecapa_encoder(device: str = "cuda")->EncoderClassifier:
+def using_ecapa_encoder(device: str|int = "cuda")->EncoderClassifier:
     encoder = EncoderClassifier.from_hparams(
         source="LanceaKing/spkrec-ecapa-cnceleb",
         run_opts={"device": device}
