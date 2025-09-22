@@ -10,6 +10,7 @@ from pathlib import Path
 from rich.progress import track
 from ecapa_annote import ERes2NetV2Encoder, ECAPAEncoder
 from functools import lru_cache
+from collections import defaultdict
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -19,14 +20,115 @@ torch.backends.cudnn.allow_tf32 = True
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.*")
 
 
+def extract_speaker_stems_with_silence_control(
+    audio_path: str | Path,
+    segments: list[tuple[float, float, str | int]],
+    root: str | Path,
+    max_silence_s: float = 2.5,  # 新增：分段之间的最大静音秒数
+    fade_ms: float = 20.0,  # 稍长的淡入淡出以平滑拼接
+):
+    """
+    为每个说话人导出独立的、合并后的音轨，并控制片段间的最大静音时长。
+
+    Args:
+        audio_path (str | Path): 原始音频文件路径。
+        segments (list): 包含 (start, end, speaker) 的片段列表。
+        root (str | Path): 保存输出文件的根目录。
+        max_silence_s (float): 两个连续片段之间的最大静音秒数。
+                               如果原始静音更短，则保留原始静音。
+        fade_ms (float): 在每个片段的开头和结尾应用的淡入淡出时长（毫秒）。
+    """
+    audio_path = Path(audio_path)
+    y, sr = torchaudio.load(str(audio_path))
+    num_channels, num_samples = y.shape
+
+    speaker_segments = defaultdict(list)
+    for start, end, speaker in segments:
+        speaker_segments[speaker].append((start, end))
+
+    for speaker in speaker_segments:
+        speaker_segments[speaker].sort()
+
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    out_paths = {}
+
+    # --- 4. 为每个说话人独立处理并生成新音轨 ---
+    for speaker, segs in track(
+        speaker_segments.items(), description="正在导出说话人音轨..."
+    ):
+        final_chunks = []
+
+        fade_samples = int(round(fade_ms / 1000.0 * sr))
+        fade_tf = torchaudio.transforms.Fade(
+            fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape="linear"
+        )
+
+        last_end_s = 0.0
+
+        for i, (start_s, end_s) in enumerate(segs):
+            # 添加静音
+            if i > 0:
+                actual_gap_s = start_s - last_end_s
+                silence_duration_s = min(actual_gap_s, max_silence_s)
+
+                if silence_duration_s > 0:
+                    silence_samples = int(silence_duration_s * sr)
+                    silence_tensor = torch.zeros(
+                        (num_channels, silence_samples), dtype=y.dtype
+                    )
+                    final_chunks.append(silence_tensor)
+
+            # 提取并处理语音片段
+            start_samples = int(start_s * sr)
+            end_samples = int(end_s * sr)
+            speech_chunk = y[:, start_samples:end_samples]
+
+            if speech_chunk.shape[1] >= fade_samples * 2:
+                speech_chunk = fade_tf(speech_chunk)
+
+            final_chunks.append(speech_chunk)
+
+            last_end_s = end_s
+
+        if not final_chunks:
+            continue  # 如果该说话人没有任何有效片段，则跳过
+
+        final_waveform = torch.cat(final_chunks, dim=1)
+
+        out_path = root / f"{audio_path.stem}-{speaker}.flac"
+
+        torchaudio.save(
+            str(out_path), final_waveform, sr, format="flac", bits_per_sample=16
+        )
+        out_paths[speaker] = out_path
+
+    return out_paths
+
+
 @lru_cache(maxsize=1)
-def using_speaker_diarization_cnceleb(device: str | int = 0):
+def using_speaker_diarization_cnceleb(
+    device: str | int = 0,
+    min_speech_duration_s: float = 0.2,
+    min_silence_duration_s: float = 0.1,
+    clustering_threshold: float = 0.65,
+):
     diarizer = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         use_auth_token=os.getenv("HF_TOKEN"),
     )
     diarizer.embedding = ERes2NetV2Encoder()  # ECAPAEncoder(0)
     diarizer.to(torch.device(device))
+    diarizer.segmentation.threshold = 0.5
+    diarizer.segmentation.min_duration_on = (
+        min_speech_duration_s  # 短于该值的语音段会被去除
+    )
+    diarizer.segmentation.min_duration_off = (
+        min_silence_duration_s  # 短于该值的静音会被“填平”（避免把同一人说话切得太碎）
+    )
+    diarizer.clustering.threshold = (
+        clustering_threshold  # 余弦相似度阈值（越低越“爱合并”）
+    )
     return diarizer
 
 
@@ -80,188 +182,18 @@ def extract_speaker_stems(
     return out_paths
 
 
-# ---- 静音压缩相关工具 ----
-def _merge_union(segments: list[tuple[float, float, str | int]]):
-    """将多说话人片段合并成时间上的并集 [(start, end), ...]（单位：秒）。"""
-    if not segments:
-        return []
-    ivals = sorted([(float(s), float(e)) for s, e, _ in segments])
-    merged: list[tuple[float, float]] = []
-    cur_s, cur_e = ivals[0]
-    for s, e in ivals[1:]:
-        if s <= cur_e:
-            cur_e = max(cur_e, e)
-        else:
-            merged.append((cur_s, cur_e))
-            cur_s, cur_e = s, e
-    merged.append((cur_s, cur_e))
-    return merged
-
-
-def _append_with_xfade(
-    out: torch.Tensor | None,
-    piece: torch.Tensor,
-    xfade: int,
-) -> torch.Tensor:
-    """将 piece 追加到 out，使用线性交叉淡化，输入形状均为 (C, T)。"""
-    if out is None:
-        return piece.clone()
-    if xfade <= 0:
-        return torch.cat([out, piece], dim=1)
-
-    c = min(xfade, out.shape[1], piece.shape[1])
-    if c == 0:
-        return torch.cat([out, piece], dim=1)
-
-    win_in = torch.linspace(0.0, 1.0, steps=c, dtype=out.dtype, device=out.device)
-    win_out = 1.0 - win_in
-
-    cross = out[:, -c:] * win_out + piece[:, :c] * win_in
-    return torch.cat([out[:, :-c], cross, piece[:, c:]], dim=1)
-
-
-def compress_long_silences(
-    y: torch.Tensor,
-    sr: int,
-    speech_union: list[tuple[float, float]],
-    max_silence_s: float = 0.5,
-    crossfade_ms: float = 10.0,
-) -> tuple[torch.Tensor, list[tuple[float, float, float]]]:
-    """
-    根据讲话并集，压缩相邻讲话之间过长的静音（> max_silence_s），并用交叉淡化拼接。
-
-    返回：
-      - 压缩后的波形 y2 (C, T')
-      - pieces: 列表[(orig_start, orig_end, new_start)]，用于时间重映射
-    """
-    if not speech_union:
-        return y, [(0.0, y.shape[1] / sr, 0.0)]
-
-    xfade = int(round(crossfade_ms / 1000.0 * sr))
-    n = y.shape[1]
-    pieces: list[tuple[int, int]] = []  # 样本级 orig 区间
-
-    prev_end = 0
-    for us, ue in speech_union:
-        us_i = max(0, int(round(us * sr)))
-        ue_i = min(n, int(round(ue * sr)))
-        if ue_i <= us_i:
-            continue
-
-        # 保留紧邻讲话前的静音 up to max_silence
-        gap = us_i - prev_end
-        if gap > 0:
-            keep = min(gap, int(round(max_silence_s * sr)))
-            if keep > 0:
-                pieces.append((us_i - keep, us_i))
-
-        # 保留讲话区间
-        pieces.append((us_i, ue_i))
-        prev_end = ue_i
-
-    # 处理尾部静音
-    tail = n - prev_end
-    if tail > 0:
-        keep = min(tail, int(round(max_silence_s * sr)))
-        if keep > 0:
-            pieces.append((n - keep, n))
-
-    # 逐段拼接并记录新时间轴
-    out: torch.Tensor | None = None
-    new_pieces: list[tuple[float, float, float]] = []
-    cur_new = 0  # 样本级
-    for a, b in pieces:
-        p = y[:, a:b]
-        out = _append_with_xfade(out, p, xfade)
-        # 交叉淡化生效后，新追加长度为 p.shape[1] - overlap，其中 overlap≈xfade
-        # 但记录的 new_start 以 piece 拼接前的 cur_new 为准即可
-        new_start_s = cur_new / sr
-        new_pieces.append((a / sr, b / sr, new_start_s))
-        if out is None:
-            cur_new = 0
-        else:
-            # 实际追加长度：第一块直接长度，其它块额外增加 len(p)-c
-            # 简化：用 out 的总长度追踪
-            cur_new = out.shape[1]
-
-    return out if out is not None else y[:, :0], new_pieces
-
-
-def remap_segments(
-    segments: list[tuple[float, float, str | int]],
-    pieces: list[tuple[float, float, float]],
-) -> list[tuple[float, float, str | int]]:
-    """根据 pieces 将 (start,end,speaker) 重映射到压缩后的时间轴。
-    假设每个讲话段完全位于某个 piece(讲话片段) 内。
-    """
-    remapped: list[tuple[float, float, str | int]] = []
-    for s, e, spk in segments:
-        # 找到覆盖 start 的 piece
-        ps = next((p for p in pieces if p[0] <= s < p[1]), None)
-        pe = next((p for p in pieces if p[0] < e <= p[1]), None)
-        if ps is None or pe is None:
-            # 某些边界误差时回退：不变
-            remapped.append((s, e, spk))
-            continue
-        new_s = ps[2] + (s - ps[0])
-        new_e = pe[2] + (e - pe[0])
-        remapped.append((new_s, new_e, spk))
-    return remapped
-
-
-def extract_speaker_stems_with_silence_compression(
-    audio_path: str | Path,
-    segments: list[tuple[float, float, str | int]],
-    root: str | Path,
-    fade_ms: float = 10.0,
-    max_silence_s: float = 0.5,
-    crossfade_ms: float = 10.0,
-):
-    """
-    在导出说话人轨道前，先按“讲话并集”压缩过长静音（> max_silence_s），
-    并对拼接处做交叉淡化（crossfade_ms）。随后按新时间轴导出各说话人音轨。
-    """
-    y, sr = torchaudio.load(str(audio_path))
-    union = _merge_union(segments)
-    y2, pieces = compress_long_silences(y, sr, union, max_silence_s, crossfade_ms)
-    remapped = remap_segments(segments, pieces)
-
-    speakers = sorted(list({seg[-1] for seg in remapped}))
-    _, n2 = y2.shape
-    stems = {spk: torch.zeros_like(y2) for spk in speakers}  # type: ignore
-
-    fade = int(round(fade_ms / 1000.0 * sr))
-    fade_tf = torchaudio.transforms.Fade(
-        fade_in_len=fade, fade_out_len=fade, fade_shape="linear"
-    )
-
-    for s, e, spk in remapped:
-        s_i = max(0, int(round(s * sr)))
-        e_i = min(n2, int(round(e * sr)))
-        if e_i <= s_i:
-            continue
-        chunk = y2[:, s_i:e_i]
-        if (e_i - s_i) >= fade and fade > 0:
-            chunk = fade_tf(chunk)
-        stems[spk][:, s_i:e_i] += chunk  # type: ignore
-
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    out_paths = {}
-    for spk, wav in stems.items():
-        out_path = root / f"{Path(audio_path).stem}-compressed-{spk}.flac"
-        torchaudio.save(str(out_path), wav, sr, format="flac", bits_per_sample=16)
-        out_paths[spk] = out_path
-    return out_paths, remapped
-
-
 def diarize_audio(
     audio_filepath: str,
     min_speakers: int = 2,
     max_speakers: int = 6,
     rttm_filepath: str | None = None,
 ) -> list[tuple[float, float, str | int]]:
-    diarize = using_speaker_diarization_cnceleb()
+    diarize = using_speaker_diarization_cnceleb(
+        device=0,
+        min_speech_duration_s=0.2,
+        min_silence_duration_s=0.1,
+        clustering_threshold=0.65,
+    )
 
     with ProgressHook() as hook:
         diarization: Annotation = diarize(
@@ -357,32 +289,12 @@ def expand_audios(root: Path):
     return audios, root
 
 
-def merge_adjacent_skip_shorts(
-    segments: list[tuple[float, float, int | str]], gap: float = 1.0, min_speech_s: float = 0.25,
-) -> list[tuple[float, float, int | str]]:
-
-    def too_short(s, e, spk)->bool:
-        return (e-s)<min_speech_s
-
-    # 辅助函数：合并属于同一个说话人的相邻片段
-    segments = [s for s in segments if not too_short(*s)]
-    if not segments:
-        return []
-    merged = [segments[0]]
-    for next_s, next_e, next_spk in segments[1:]:
-        last_s, last_e, last_spk = merged[-1]
-        if next_spk == last_spk and (next_s - last_e) <= gap:
-            merged[-1] = (last_s, next_e, last_spk)
-        else:
-            merged.append((next_s, next_e, next_spk))
-    return merged
-
-
 def main(
     root: str,
     min_speakers: int = 2,
     max_speakers: int = 6,
-    min_adjacent_gap_s: float = 1.5,
+    max_silence_s: float = 2.5,
+    fade_ms: float = 10.0,
 ):
     audios, aroot = expand_audios(Path(root))
     troot = aroot.with_stem(f"{aroot.stem}-speakers")
@@ -395,9 +307,10 @@ def main(
             rttm_filepath=str(apath.with_suffix(".rttm")),
         )
         print(apath, len(segments))
+        extract_speaker_stems_with_silence_control(
+            apath, segments, troot, max_silence_s=max_silence_s, fade_ms=fade_ms
+        )
 
-        segments = merge_adjacent_skip_shorts(segments, gap=min_adjacent_gap_s)
-        split_audio_by_diarization(segments, apath, troot)
     ...
 
 
