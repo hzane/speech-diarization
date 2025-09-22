@@ -53,7 +53,7 @@ def extract_speaker_stems_with_silence_control(
     root.mkdir(parents=True, exist_ok=True)
     out_paths = {}
 
-    # --- 4. 为每个说话人独立处理并生成新音轨 ---
+    # 为每个说话人独立处理并生成新音轨
     for speaker, segs in track(
         speaker_segments.items(), description="正在导出说话人音轨..."
     ):
@@ -190,9 +190,9 @@ def diarize_audio(
 ) -> list[tuple[float, float, str | int]]:
     diarize = using_speaker_diarization_cnceleb(
         device=0,
-        min_speech_duration_s=0.2,
+        min_speech_duration_s=0.25,
         min_silence_duration_s=0.1,
-        clustering_threshold=0.65,
+        clustering_threshold=0.70,
     )
 
     with ProgressHook() as hook:
@@ -217,67 +217,6 @@ def diarize_audio(
 # from pyannote.core import Annotation, Segment, Timeline
 
 
-def split_audio_by_diarization(
-    diarization: list[tuple[float, float, int | str]],
-    audio_path: str | Path,
-    root: str | Path,
-    fade_duration_ms: int = 10,
-    flac_compression_level: int = 8,  # 新增：FLAC 压缩级别 (0-8)
-    bits_per_sample: int = 16,  # 新增：输出文件的位深度
-):
-    """
-    将音频切分并保存为指定格式。
-
-    Args:
-        diarization: pyannote.audio.Annotation 对象。
-        audio_path (str): 原始音频文件路径。
-        root (str): 保存切分后音频的根目录。
-        fade_duration_ms (int): 淡入淡出时长（毫秒）。
-        output_format (str): 输出音频的格式，如 'flac' 或 'wav'。
-        flac_compression_level (int): FLAC 格式的压缩级别，范围从 0 (最快) 到 8 (最小)。
-        bits_per_sample (int): 输出文件的位深度 (例如 16 或 24)。
-        create_manifest (bool): 是否创建 manifest 文件。
-    """
-    audio_path, root = Path(audio_path), Path(root)
-
-    waveform, sample_rate = torchaudio.load(str(audio_path))
-
-    fade_transform = None
-    fade_in_len = 0
-    fade_out_len = 0
-
-    fade_samples = int(fade_duration_ms / 1000.0 * sample_rate)
-    fade_in_len, fade_out_len = fade_samples, fade_samples
-    fade_transform = torchaudio.transforms.Fade(
-        fade_in_len=fade_in_len, fade_out_len=fade_out_len, fade_shape="linear"
-    )
-
-    for start, end, speaker in track(diarization, description="正在切分音频..."):
-        start_sample = int(start * sample_rate)
-        end_sample = int(end * sample_rate)
-        if start_sample >= end_sample:
-            continue
-        audio_chunk = waveform[:, start_sample:end_sample]
-
-        if audio_chunk.shape[1] >= (fade_in_len + fade_out_len):
-            audio_chunk = fade_transform(audio_chunk)
-
-        # 准备输出路径和文件名
-        target_path = (
-            root
-            / f"{audio_path.stem}-{speaker}/{audio_path.stem}-{speaker}-{start_sample}.flac"
-        )
-        target_path.parent.mkdir(exist_ok=True, parents=True)
-
-        torchaudio.save(
-            str(target_path),
-            audio_chunk,
-            sample_rate,
-            format="flac",
-            compression=flac_compression_level,
-            bits_per_sample=bits_per_sample,
-        )
-
 
 def expand_audios(root: Path):
     if root.is_file():
@@ -293,10 +232,12 @@ def main(
     root: str,
     min_speakers: int = 2,
     max_speakers: int = 6,
-    max_silence_s: float = 2.5,
+    max_silence_s: float = 1.5,
     fade_ms: float = 10.0,
 ):
     audios, aroot = expand_audios(Path(root))
+    print(aroot, len(audios))
+
     troot = aroot.with_stem(f"{aroot.stem}-speakers")
 
     for apath in track(audios, description="diarization", disable=True):
@@ -311,13 +252,9 @@ def main(
             apath, segments, troot, max_silence_s=max_silence_s, fade_ms=fade_ms
         )
 
-    ...
-
 
 if __name__ == "__main__":
     from jsonargparse import auto_cli
-
-    "/data.d/bilix/bilix/yangliv-30s/ytt65VoeVxDwU-2157-5_ROCK_ROAST5_vocals_5_dialog_0.wav"
     auto_cli(main)
 
 '''
