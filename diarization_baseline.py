@@ -20,6 +20,119 @@ torch.backends.cudnn.allow_tf32 = True
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.*")
 
 
+def extract_speaker_stems_with_time_limit(
+    audio_path: str | Path,
+    segments: list[tuple[float, float, str | int]],
+    root: str | Path,
+    max_speech_s: float = 15.0,  # 新增：每条输出音轨的最大语音时长（秒）
+    max_silence_s: float = 1.0,
+    fade_ms: float = 20.0,
+):
+    """
+    为每个说话人导出合并后的音轨，同时确保每条音轨的时长
+    不超过 max_speech_s 的限制。
+
+    Args:
+        audio_path (str | Path): 原始音频文件路径。
+        segments (list): 包含 (start, end, speaker) 的片段列表。
+        root (str | Path): 保存输出文件的根目录。
+        max_speech_s (float): 每条输出音轨的最大目标时长（秒）。
+        max_silence_s (float): 两个连续片段之间的最大静音秒数。
+        fade_ms (float): 在每个片段的开头和结尾应用的淡入淡出时长（毫秒）。
+    """
+    audio_path = Path(audio_path)
+    y, sr = torchaudio.load(str(audio_path))
+    num_channels, num_samples = y.shape
+
+    speaker_segments = defaultdict(list)
+    for start, end, speaker in segments:
+        speaker_segments[speaker].append((start, end))
+    for speaker in speaker_segments:
+        speaker_segments[speaker].sort()
+
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    out_paths = defaultdict(list)  # 每个说话人可能有多条音轨
+
+    fade_samples = int(round(fade_ms / 1000.0 * sr))
+    fade_tf = torchaudio.transforms.Fade(
+        fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape="linear"
+    )
+    for speaker, segs in track(
+        speaker_segments.items(), description="正在导出限时音轨..."
+    ):
+        # 变量用于管理当前正在构建的音轨
+        current_track_chunks = []
+        current_track_duration_s = 0.0
+        track_count_for_speaker = 0
+
+        last_end_s = 0.0
+
+        def save_current_track():
+            """一个辅助函数，用于保存当前构建的音轨并重置状态。"""
+            nonlocal \
+                track_count_for_speaker, \
+                current_track_chunks, \
+                current_track_duration_s
+
+            if not current_track_chunks:
+                return
+
+            final_waveform = torch.cat(current_track_chunks, dim=1)
+            out_filename = (
+                f"{audio_path.stem}-{speaker}-{track_count_for_speaker:03d}.flac"
+            )
+            out_path = root / out_filename
+            torchaudio.save(
+                str(out_path), final_waveform, sr, format="flac", bits_per_sample=16
+            )
+            out_paths[speaker].append(str(out_path.absolute()))
+
+            # 重置状态以开始新音轨
+            track_count_for_speaker += 1
+            current_track_chunks = []
+            current_track_duration_s = 0.0
+
+        for i, (start_s, end_s) in enumerate(segs):
+            speech_duration_s = end_s - start_s
+            silence_duration_s = 0.0
+            if i > 0:
+                actual_gap_s = start_s - last_end_s
+                silence_duration_s = min(actual_gap_s, max_silence_s)
+
+            # 如果当前音轨加上新的静音和语音会超过限制，则先保存当前音轨
+            if current_track_duration_s > 0 and (
+                current_track_duration_s + silence_duration_s + speech_duration_s
+                > max_speech_s
+            ):
+                save_current_track()
+                silence_duration_s = 0.0
+
+            if silence_duration_s > 0:
+                silence_samples = int(silence_duration_s * sr)
+                silence_tensor = torch.zeros(
+                    (num_channels, silence_samples), dtype=y.dtype
+                )
+                current_track_chunks.append(silence_tensor)
+                current_track_duration_s += silence_duration_s
+
+            start_samples = int(start_s * sr)
+            end_samples = int(end_s * sr)
+            speech_chunk = y[:, start_samples:end_samples]
+
+            if speech_chunk.shape[1] >= fade_samples * 2:
+                speech_chunk = fade_tf(speech_chunk)
+
+            current_track_chunks.append(speech_chunk)
+            current_track_duration_s += speech_duration_s
+
+            last_end_s = end_s
+
+        save_current_track()
+
+    return dict(out_paths)  # 将 defaultdict 转换回普通字典
+
+
 def extract_speaker_stems_with_silence_control(
     audio_path: str | Path,
     segments: list[tuple[float, float, str | int]],
@@ -109,9 +222,9 @@ def extract_speaker_stems_with_silence_control(
 @lru_cache(maxsize=1)
 def using_speaker_diarization_cnceleb(
     device: str | int = 0,
-    min_speech_duration_s: float = 0.2,
-    min_silence_duration_s: float = 0.1,
-    clustering_threshold: float = 0.65,
+    min_speech_duration_s: float = 0.2, # 短于该值的语音段会被去除
+    min_silence_duration_s: float = 0.1, # 短于该值的静音会被“填平”（避免把同一人说话切得太碎）
+    clustering_threshold: float = 0.7, # 余弦相似度阈值（越低越“爱合并”）
 ):
     diarizer = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
@@ -120,15 +233,10 @@ def using_speaker_diarization_cnceleb(
     diarizer.embedding = ERes2NetV2Encoder()  # ECAPAEncoder(0)
     diarizer.to(torch.device(device))
     diarizer.segmentation.threshold = 0.5
-    diarizer.segmentation.min_duration_on = (
-        min_speech_duration_s  # 短于该值的语音段会被去除
-    )
-    diarizer.segmentation.min_duration_off = (
-        min_silence_duration_s  # 短于该值的静音会被“填平”（避免把同一人说话切得太碎）
-    )
-    diarizer.clustering.threshold = (
-        clustering_threshold  # 余弦相似度阈值（越低越“爱合并”）
-    )
+    diarizer.segmentation.min_duration_on = min_speech_duration_s
+    diarizer.segmentation.min_duration_off = min_silence_duration_s
+
+    diarizer.clustering.threshold = clustering_threshold
     return diarizer
 
 
@@ -182,6 +290,79 @@ def extract_speaker_stems(
     return out_paths
 
 
+# 假设 using_speaker_diarization_cnceleb 和 ProgressHook 已经定义
+# from your_module import using_speaker_diarization_cnceleb, ProgressHook
+
+
+def diarize_audio_with_padding(
+    audio_filepath: str,
+    min_speakers: int = 1,  # 默认值改为1更合理
+    max_speakers: int = 6,
+    rttm_filepath: str | None = None,
+    padding_s: float = 0.05,  # 新增：要增加的填充时长（秒）
+    min_gap_s: float = 0.1,  # 新增：触发填充的最小静音间隔（秒）
+) -> list[tuple[float, float, str | int]]:
+    """
+    执行说话人日志，并在不同说话人的片段间存在静音时，为片段边界添加填充。
+    """
+    diarize = using_speaker_diarization_cnceleb(
+        device=0,
+        min_speech_duration_s=0.25,
+        min_silence_duration_s=min_gap_s,
+        clustering_threshold=0.70,
+    )
+
+    with ProgressHook() as hook:
+        diarization_result: Annotation = diarize(
+            audio_filepath,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            hook=hook,
+        )
+
+    initial_segments = sorted(
+        [
+            (turn.start, turn.end, speaker)
+            for turn, _, speaker in diarization_result.itertracks(yield_label=True)
+        ],  # type: ignore
+        key=lambda x: x[0],
+    )
+
+    if not initial_segments:
+        return []
+
+    def adjust_segment_boundaries(
+        segments, padding, min_gap
+    ) -> list[tuple[float, float, int | str]]:
+        if len(segments) < 2:
+            return segments
+
+        adjusted = list(segments)  # 创建一个可修改的副本
+
+        for i in range(len(adjusted) - 1):
+            current_start, current_end, current_spk = adjusted[i]
+            next_start, next_end, next_spk = adjusted[i + 1]
+
+            # 检查条件：
+            # b) 它们之间存在实际的静音间隙
+            # c) 静音间隙大于我们设定的阈值
+            gap = next_start - current_end
+            if current_spk != next_spk and gap > 0 and gap >= min_gap:
+                adjusted[i] = (current_start, current_end + padding, current_spk)
+                adjusted[i + 1] = (max(0, next_start - padding), next_end, next_spk)
+
+        return adjusted
+
+    final_segments = adjust_segment_boundaries(
+        initial_segments, padding=padding_s, min_gap=min_gap_s
+    )
+    if rttm_filepath:
+        with open(rttm_filepath, "w") as f:
+            diarization_result.write_rttm(f)
+
+    return final_segments
+
+
 def diarize_audio(
     audio_filepath: str,
     min_speakers: int = 2,
@@ -217,7 +398,6 @@ def diarize_audio(
 # from pyannote.core import Annotation, Segment, Timeline
 
 
-
 def expand_audios(root: Path):
     if root.is_file():
         root = root.resolve()
@@ -230,31 +410,37 @@ def expand_audios(root: Path):
 
 def main(
     root: str,
-    min_speakers: int = 2,
+    min_speakers: int = 1,
     max_speakers: int = 6,
     max_silence_s: float = 1.5,
-    fade_ms: float = 10.0,
+    max_speech_s: float = 15.0,
+    fade_ms: float = 20.0,
 ):
     audios, aroot = expand_audios(Path(root))
     print(aroot, len(audios))
 
-    troot = aroot.with_stem(f"{aroot.stem}-speakers")
-
     for apath in track(audios, description="diarization", disable=True):
-        segments = diarize_audio(
+        troot = root / apath.with_name(f"{apath.stem}-speakers")
+        segments = diarize_audio_with_padding(
             str(apath),
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             rttm_filepath=str(apath.with_suffix(".rttm")),
         )
         print(apath, len(segments))
-        extract_speaker_stems_with_silence_control(
-            apath, segments, troot, max_silence_s=max_silence_s, fade_ms=fade_ms
+        extract_speaker_stems_with_time_limit(
+            apath,
+            segments,
+            troot,
+            max_speech_s=max_speech_s,
+            max_silence_s=max_silence_s,
+            fade_ms=fade_ms,
         )
 
 
 if __name__ == "__main__":
     from jsonargparse import auto_cli
+
     auto_cli(main)
 
 '''
