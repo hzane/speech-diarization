@@ -98,11 +98,11 @@ class AudioEnhancer(nn.Module):
 
         return enhanced_waveform.cpu()
 
-    def enhance_audio_chunked(
+    def enhance_audio(
         self,
         waveform: torch.Tensor,
         sample_rate: int,
-        chunk_size_s: float = 60.0,
+        chunk_size_s: float = 360.0,
         overlap_s: float = 1
     ) -> torch.Tensor:
         """
@@ -162,11 +162,12 @@ def using_gtcrn(model_path:str|Path|None=None, device:str|int = 0):
 
 
 if __name__ == '__main__':
-    filepath = '/data.d/bilix/bilix/yangliv-30s/ytt65VoeVxDwU-2157-5_ROCK_ROAST5_vocals_5_dialog_0.wav'
+    filepath = '/data.d/bilix/bilix/yangli.clearvoiced/yt9zJk0VMYWRk-1821-3_S3_ROCK_ROAST.flac'
 
     mix, sr = gtcrn_read_audio(filepath, 16000)
 
     xenhancer = using_gtcrn()
-    enh = xenhancer.enhance_audio_chunked(mix, sr)
+    enh = xenhancer.enhance_audio(mix, sr)
+    print(enh.shape)
     # enh = enhance_audio_chunked(enhancer, mix, sr)
     torchaudio.save_with_torchcodec("x.flac", enh, sr)

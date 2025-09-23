@@ -14,6 +14,7 @@ from ecapa_annote import ERes2NetV2Encoder, ECAPAEncoder
 from functools import lru_cache
 from collections import defaultdict
 # from zipenhancer_pipe import using_zipenhancer, zip_enhance
+from gtcrn_wrap import AudioEnhancer, using_gtcrn, gtcrn_read_audio
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -282,6 +283,7 @@ class Diarizer:
     def __init__(self, hparams: DiarizationParameters):
         self.hparams = hparams
         # self.ans = using_zipenhancer('cuda')
+        self.ans = using_gtcrn(device=0)
 
     def diarize(self, apath: str | Path| dict, rttm_filepath: str | Path|None):
         segments = diarize_audio(
@@ -323,7 +325,10 @@ class Diarizer:
 
     def __call__(self, audio_path:str|Path, root:str|Path, with_rttm:bool = False):
         rttm_filepath = Path(audio_path).with_suffix(".rttm") if with_rttm else None
-        segments = self.diarize(audio_path, rttm_filepath)
+        wav, sr = gtcrn_read_audio(audio_path, sr=16000)
+        audio= self.ans.enhance_audio(wav, sr)
+
+        segments = self.diarize(dict(waveform=audio, sample_rate=sr), rttm_filepath)
         segments = self.merge_segments(segments)
         segments = self.pad_segment(segments)
 
