@@ -2,7 +2,7 @@ import torch
 import os
 import warnings
 import torchaudio
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from dacite import from_dict, Config as DaciteConfig
 from pyannote.audio import Pipeline
 from pyannote.core import Annotation
@@ -10,11 +10,11 @@ from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 from pathlib import Path
 from rich.progress import track
-from ecapa_annote import ERes2NetV2Encoder, ECAPAEncoder
+from ecapa_annote import ERes2NetV2Encoder
 from functools import lru_cache
 from collections import defaultdict
 # from zipenhancer_pipe import using_zipenhancer, zip_enhance
-from gtcrn_wrap import AudioEnhancer, using_gtcrn, gtcrn_read_audio
+from gtcrn_wrap import using_gtcrn, gtcrn_read_audio
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -71,7 +71,6 @@ def extract_speaker_stems(
         audio_path = Path(root)
 
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
 
     speaker_segments = defaultdict(list)
     for start, end, speaker in segments:
@@ -97,6 +96,8 @@ def extract_speaker_stems(
                 f"{speaker}/{audio_path.stem}-{len(output_files[speaker]):03d}.flac"
             )
             out_path = root / out_filename
+            out_path.parent.mkdir(parents = True, exist_ok = True)
+
             torchaudio.save(
                 str(out_path), final_waveform, sr, format="flac", bits_per_sample=16
             )
