@@ -13,6 +13,7 @@ from rich.progress import track
 from ecapa_annote import ERes2NetV2Encoder, ECAPAEncoder
 from functools import lru_cache
 from collections import defaultdict
+# from zipenhancer_pipe import using_zipenhancer, zip_enhance
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -24,37 +25,32 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.*
 
 @dataclass(frozen=True)
 class DiarizationParameters:
-    max_speech_s: float = 10.0  # 每条输出音轨的最大目标时长
-    same_speaker_max_gap_s: float = 3.0  # 邻接同说话人可合并最大间隔
+    min_stem_s: float = 3.
+    max_segment_s: float = 20.0  # 每条输出音轨的最大目标时长
+    same_speaker_gap_s: float = 3.0  # 邻接同说话人可合并最大间隔
     # 可合并的两个连续片段之间的最大静音秒数, 触发填充的最小静音间隔
     max_gap_s: float = 1.2
     fade_ms: float = 20.0  # 在每个片段的开头和结尾应用的淡入淡出时长（毫秒）
     min_speech_duration_s: float = 0.2  # 短于该值的语音段会被去除
-    # 短于该值的静音会被“填平”（避免把同一人说话切得太碎）
-    min_silence_duration_s: float = 0.1
+    min_silence_duration_s: float = 0.1  # 短于该值的静音会被“填平”
     clustering_threshold: float = 0.7  # 余弦相似度阈值（越低越“爱合并”）
-    padding_s: float = 0.03  # 新增：要增加的填充时长（秒）
-
-
-def using_hparams() -> DiarizationParameters:
-    ret = from_dict(
-        data_class=DiarizationParameters, data={}, config=DaciteConfig(strict=True)
-    )
-    return ret
+    min_speakers: int = 2
+    max_speakers: int = 6
 
 
 def extract_speaker_stems(
-    audio_path: str | Path,
+    audio: str | Path | dict,
     segments: list[tuple[float, float, str | int]],
     root: str | Path,
     max_segment_s: float,
     max_gap_s: float,
     fade_ms: float,
+    min_stem_s: float,
 ) -> dict[str | int, list[str]]:
     """
     为每个说话人导出合并后的音轨，并确保每条音轨的时长不超过 max_segment_s。
     Args:
-        audio_path (str | Path): 原始音频文件路径。
+        audio (str | Path | dict[waveform, sample_rate]): 原始音频文件路径。
         segments (list): 包含 (start, end, speaker) 的片段列表。
         root (str | Path): 保存输出文件的根目录。
         max_segment_s (float): 每条输出音轨的最大目标时长（秒）。
@@ -64,9 +60,14 @@ def extract_speaker_stems(
     Returns:
         dict[str | int, list[str]]: 一个字典，映射说话人ID到其生成的文件路径列表。
     """
-    audio_path = Path(audio_path)
-    y, sr = torchaudio.load(str(audio_path))
-    num_channels, _ = y.shape
+    if isinstance(audio, str|Path):
+        audio_path = Path(audio)
+        y, sr = torchaudio.load(str(audio))
+        num_channels, _ = y.shape
+    else:
+        y, sr = audio['waveform'], audio['sample_rate']
+        num_channels = y.shape[0]
+        audio_path = Path(root)
 
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -82,14 +83,22 @@ def extract_speaker_stems(
     for speaker, segs in track(
         speaker_segments.items(), description="正在导出限时音轨..."
     ):
+
         def _save_track(chunks_to_save: list):
             if not chunks_to_save:
                 return
+            duration = sum(c.shape[1] for c in chunks_to_save) / sr
+            if duration < min_stem_s:
+                return
 
             final_waveform = torch.cat(chunks_to_save, dim=1)
-            out_filename = f"{audio_path.stem}-{speaker}-{len(output_files[speaker]):03d}.flac"
+            out_filename = (
+                f"{speaker}/{audio_path.stem}-{len(output_files[speaker]):03d}.flac"
+            )
             out_path = root / out_filename
-            torchaudio.save(str(out_path), final_waveform, sr, format="flac", bits_per_sample=16)
+            torchaudio.save(
+                str(out_path), final_waveform, sr, format="flac", bits_per_sample=16
+            )
             output_files[speaker].append(str(out_path.absolute()))
 
         # 初始化状态变量
@@ -112,7 +121,10 @@ def extract_speaker_stems(
                 silence_duration_s = min(actual_gap_s, max_gap_s)
 
             # 如果当前块非空，并且加上新片段会超长，则先保存当前块
-            if current_track_duration_s + silence_duration_s + speech_duration_s > max_segment_s:
+            if (
+                current_track_duration_s + silence_duration_s + speech_duration_s
+                > max_segment_s
+            ):
                 _save_track(current_track_chunks)
 
                 # 重置状态，开始新的音轨
@@ -123,7 +135,9 @@ def extract_speaker_stems(
 
             if silence_duration_s > 0:
                 silence_samples = int(silence_duration_s * sr)
-                silence_tensor = torch.zeros((num_channels, silence_samples), dtype=y.dtype)
+                silence_tensor = torch.zeros(
+                    (num_channels, silence_samples), dtype=y.dtype
+                )
                 current_track_chunks.append(silence_tensor)
                 current_track_duration_s += silence_duration_s
 
@@ -170,12 +184,14 @@ def using_speaker_diarization_cnceleb(
 
 
 def merge_same_speaker(
-    segments: list[tuple[float, float, int]], max_gap_s: float, max_segment_s: float,
+    segments: list[tuple[float, float, int | str]],
+    max_gap_s: float,
+    max_segment_s: float,
 ):
     if not segments:
         return []
 
-    merged: list[tuple[float, float, int]] = [segments[0]]
+    merged: list[tuple[float, float, int | str]] = [segments[0]]
 
     for next_start, next_end, next_spk in segments[1:]:
         cur_start, cur_end, cur_spk = merged[-1]
@@ -196,7 +212,7 @@ def merge_same_speaker(
 
 
 def adjust_segment_boundaries(
-    segments, padding:float
+    segments, padding: float
 ) -> list[tuple[float, float, int | str]]:
     if len(segments) < 2:
         return segments
@@ -215,68 +231,18 @@ def adjust_segment_boundaries(
     return adjusted
 
 
-def diarize_audio_with_padding(
-    audio_filepath: str,
-    min_speakers: int,  # 默认值改为1更合理
-    max_speakers: int,
-    rttm_filepath: str | None,
-    padding_s: float,  # 新增：要增加的填充时长（秒）
+def diarize_audio(
+    audio_filepath: str | Path|dict,
     min_speech_duration_s: float,
-    min_silence_duration_s: float,  # 新增：触发填充的最小静音间隔（秒）
-    same_speaker_gap_s: float,
-    max_segment_s: float,
+    min_silence_duration_s: float,
+    min_speakers: int,
+    max_speakers: int,
+    rttm_filepath: str | Path | None = None,
 ) -> list[tuple[float, float, str | int]]:
-    """
-    执行说话人日志，并在不同说话人的片段间存在静音时，为片段边界添加填充。
-    """
     diarize = using_speaker_diarization_cnceleb(
         device=0,
         min_speech_duration_s=min_speech_duration_s,
         min_silence_duration_s=min_silence_duration_s,
-        clustering_threshold=0.70,
-    )
-
-    with ProgressHook() as hook:
-        diarization_result: Annotation = diarize(
-            audio_filepath,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            hook=hook,
-        )
-
-    segments = sorted(
-        [
-            (turn.start, turn.end, speaker)
-            for turn, _, speaker in diarization_result.itertracks(yield_label=True)  # type: ignore
-        ],
-        key=lambda x: x[0],
-    )
-    if not segments:
-        return []
-    segments = merge_same_speaker(
-        segments, # type:ignore
-        max_gap_s=same_speaker_gap_s,
-        max_segment_s=max_segment_s,
-    )
-
-    final_segments = adjust_segment_boundaries(segments, padding=padding_s)
-    if rttm_filepath:
-        with open(rttm_filepath, "w") as f:
-            diarization_result.write_rttm(f)
-
-    return final_segments
-
-
-def diarize_audio(
-    audio_filepath: str,
-    min_speakers: int = 2,
-    max_speakers: int = 6,
-    rttm_filepath: str | None = None,
-) -> list[tuple[float, float, str | int]]:
-    diarize = using_speaker_diarization_cnceleb(
-        device=0,
-        min_speech_duration_s=0.25,
-        min_silence_duration_s=0.1,
         clustering_threshold=0.70,
     )
 
@@ -312,40 +278,132 @@ def expand_audios(root: Path):
     return audios, root
 
 
+class Diarizer:
+    def __init__(self, hparams: DiarizationParameters):
+        self.hparams = hparams
+        # self.ans = using_zipenhancer('cuda')
+
+    def diarize(self, apath: str | Path| dict, rttm_filepath: str | Path|None):
+        segments = diarize_audio(
+            apath,
+            self.hparams.min_speech_duration_s,
+            min_silence_duration_s=self.hparams.min_silence_duration_s,
+            min_speakers=self.hparams.min_speakers,
+            max_speakers=self.hparams.max_speakers,
+            rttm_filepath=rttm_filepath,
+        )
+        segments = sorted(segments)
+        return segments
+
+    def merge_segments(self, segments: list[tuple[float, float, int | str]]):
+        segments = merge_same_speaker(
+            segments, self.hparams.max_gap_s, self.hparams.max_segment_s
+        )
+        return segments
+
+    def pad_segment(self, segments):
+        segments = adjust_segment_boundaries(
+            segments, padding=self.hparams.fade_ms * 2 / 1000
+        )
+        return segments
+
+    def extract_speaker(
+        self, segments, audio_path: str | Path | dict, root: str | Path
+    ) -> dict:
+        info = extract_speaker_stems(
+            audio_path,
+            segments,
+            root,
+            self.hparams.max_segment_s,
+            self.hparams.max_gap_s,
+            self.hparams.fade_ms,
+            self.hparams.min_stem_s,
+        )
+        return info
+
+    def __call__(self, audio_path:str|Path, root:str|Path, with_rttm:bool = False):
+        rttm_filepath = Path(audio_path).with_suffix(".rttm") if with_rttm else None
+        segments = self.diarize(audio_path, rttm_filepath)
+        segments = self.merge_segments(segments)
+        segments = self.pad_segment(segments)
+
+        # wav, sr = zip_enhance(audio_path, self.ans)
+        # audio = dict(waveform=wav, sample_rate=sr)
+        info = self.extract_speaker(segments, audio_path, root)
+        return segments, info
+
+
 def main(
+    root: str,
+    min_speakers: int = 2,
+    max_speakers: int = 6,
+    max_segment_s: float = 20.0,
+    min_silence_duration_s: float = 0.1,
+    min_speech_duration_s: float = 0.35,
+    same_speaker_gap_s: float = 1.5,
+    max_gap_s:float = 3.0,
+    fade_ms: float = 30.0,
+):
+    args = locals()
+    args.pop('root')
+
+    hparams = from_dict(
+        data_class=DiarizationParameters, data=args, config=DaciteConfig(strict=True)
+    )
+    diarizer = Diarizer(hparams)
+    audios, aroot = expand_audios(Path(root))
+    print(aroot, len(audios))
+
+    for apath in track(audios, description="diarization", disable=True):
+        troot = root / apath.with_name(f"{apath.stem}-speakers")
+        segments, info = diarizer(apath, troot, True)
+
+        print(apath, len(segments))
+
+
+def mainx(
     root: str,
     min_speakers: int = 1,
     max_speakers: int = 6,
     min_silence_s: float = 0.1,
     max_segment_s: float = 15.0,
     min_speech_s: float = 0.25,
-    same_speaker_gap_s : float = 1.5,
-    fade_ms: float = 20.0,
+    same_speaker_gap_s: float = 1.5,
+    fade_ms: float = 30.0,
 ):
     audios, aroot = expand_audios(Path(root))
     print(aroot, len(audios))
 
     for apath in track(audios, description="diarization", disable=True):
         troot = root / apath.with_name(f"{apath.stem}-speakers")
-        segments = diarize_audio_with_padding(
-            str(apath),
+        rttm_filepath = apath.with_suffix(".rttm")
+
+        segments = diarize_audio(
+            apath,
+            min_speech_duration_s=min_speech_s,
+            min_silence_duration_s=min_silence_s,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
-            rttm_filepath=str(apath.with_suffix(".rttm")),
-            padding_s = fade_ms*2/1000,
-            min_speech_duration_s = min_speech_s,
-            min_silence_duration_s = min_silence_s,
-            same_speaker_gap_s = same_speaker_gap_s,
-            max_segment_s = max_segment_s,
+            rttm_filepath=rttm_filepath,
         )
+        segments = sorted(segments)
+        segments = merge_same_speaker(
+            segments,  # type:ignore
+            max_gap_s=same_speaker_gap_s,
+            max_segment_s=max_segment_s,
+        )
+
+        segments = adjust_segment_boundaries(segments, padding=fade_ms / 1000)
+
         print(apath, len(segments))
         extract_speaker_stems(
             apath,
             segments,
             troot,
             max_segment_s=max_segment_s,
-            max_gap_s=same_speaker_gap_s*2,
+            max_gap_s=same_speaker_gap_s * 2,
             fade_ms=fade_ms,
+            min_stem_s = 2.
         )
 
 
