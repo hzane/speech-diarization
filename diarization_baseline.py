@@ -28,11 +28,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.*
 class DiarizationParameters:
     min_stem_s: float = 3.
     max_segment_s: float = 20.0  # 每条输出音轨的最大目标时长
-    same_speaker_gap_s: float = 3.0  # 邻接同说话人可合并最大间隔
+    same_speaker_gap_s: float = 1.2  # 邻接同说话人可合并最大间隔
     # 可合并的两个连续片段之间的最大静音秒数, 触发填充的最小静音间隔
-    max_gap_s: float = 1.2
+    max_gap_s: float = 1.5
     fade_ms: float = 20.0  # 在每个片段的开头和结尾应用的淡入淡出时长（毫秒）
-    min_speech_duration_s: float = 0.2  # 短于该值的语音段会被去除
+    min_speech_duration_s: float = 0.35  # 短于该值的语音段会被去除
     min_silence_duration_s: float = 0.1  # 短于该值的静音会被“填平”
     clustering_threshold: float = 0.7  # 余弦相似度阈值（越低越“爱合并”）
     min_speakers: int = 2
@@ -295,12 +295,16 @@ class Diarizer:
             max_speakers=self.hparams.max_speakers,
             rttm_filepath=rttm_filepath,
         )
+
+        min_speech_duration_s = self.hparams.min_speech_duration_s
+        segments = [s for s in segments if s[1]-s[0] >= min_speech_duration_s]
+
         segments = sorted(segments)
         return segments
 
     def merge_segments(self, segments: list[tuple[float, float, int | str]]):
         segments = merge_same_speaker(
-            segments, self.hparams.max_gap_s, self.hparams.max_segment_s
+            segments, self.hparams.same_speaker_gap_s, self.hparams.max_segment_s
         )
         return segments
 
@@ -326,10 +330,13 @@ class Diarizer:
 
     def __call__(self, audio_path:str|Path, root:str|Path, with_rttm:bool = False):
         rttm_filepath = Path(audio_path).with_suffix(".rttm") if with_rttm else None
-        wav, sr = gtcrn_read_audio(audio_path, sr=16000)
-        audio= self.ans.enhance_audio(wav, sr)
-
-        segments = self.diarize(dict(waveform=audio, sample_rate=sr), rttm_filepath)
+        # wav, sr = gtcrn_read_audio(audio_path, sr=16000)
+        # audio= self.ans.enhance_audio(wav, sr)
+        # if audio.dim() == 1:
+        #    audio = audio.unsqueeze(0)
+        #assert audio.dim()==2 and audio.size(0) == 1, 'audio must be [1, T]'
+        # dict(waveform=audio, sample_rate=sr)
+        segments = self.diarize(audio_path, rttm_filepath)
         segments = self.merge_segments(segments)
         segments = self.pad_segment(segments)
 
@@ -346,8 +353,8 @@ def main(
     max_segment_s: float = 20.0,
     min_silence_duration_s: float = 0.1,
     min_speech_duration_s: float = 0.35,
-    same_speaker_gap_s: float = 1.5,
-    max_gap_s:float = 3.0,
+    same_speaker_gap_s: float = 1.,
+    max_gap_s:float = 1.5,
     fade_ms: float = 30.0,
 ):
     args = locals()
@@ -361,56 +368,13 @@ def main(
     print(aroot, len(audios))
 
     for apath in track(audios, description="diarization", disable=True):
+        if apath.with_suffix('.rttm').exists():
+            continue
         troot = root / apath.with_name(f"{apath.stem}-speakers")
         segments, info = diarizer(apath, troot, True)
 
         print(apath, len(segments))
 
-
-def mainx(
-    root: str,
-    min_speakers: int = 1,
-    max_speakers: int = 6,
-    min_silence_s: float = 0.1,
-    max_segment_s: float = 15.0,
-    min_speech_s: float = 0.25,
-    same_speaker_gap_s: float = 1.5,
-    fade_ms: float = 30.0,
-):
-    audios, aroot = expand_audios(Path(root))
-    print(aroot, len(audios))
-
-    for apath in track(audios, description="diarization", disable=True):
-        troot = root / apath.with_name(f"{apath.stem}-speakers")
-        rttm_filepath = apath.with_suffix(".rttm")
-
-        segments = diarize_audio(
-            apath,
-            min_speech_duration_s=min_speech_s,
-            min_silence_duration_s=min_silence_s,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            rttm_filepath=rttm_filepath,
-        )
-        segments = sorted(segments)
-        segments = merge_same_speaker(
-            segments,  # type:ignore
-            max_gap_s=same_speaker_gap_s,
-            max_segment_s=max_segment_s,
-        )
-
-        segments = adjust_segment_boundaries(segments, padding=fade_ms / 1000)
-
-        print(apath, len(segments))
-        extract_speaker_stems(
-            apath,
-            segments,
-            troot,
-            max_segment_s=max_segment_s,
-            max_gap_s=same_speaker_gap_s * 2,
-            fade_ms=fade_ms,
-            min_stem_s = 2.
-        )
 
 
 if __name__ == "__main__":

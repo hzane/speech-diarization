@@ -10,6 +10,29 @@ from pathlib import Path
 from torchcodec.encoders import AudioEncoder
 
 
+def ans_audio_norm(x: torch.Tensor) -> torch.Tensor:
+    # 确保输入是浮点类型，以进行精确计算
+    x = x.float()
+
+    # 第一步：基于整体 RMS 的标准化
+    rms = torch.mean(x**2) ** 0.5
+    scalar = 10 ** (-25 / 20) / (rms + 1e-8)  # 增加一个小的 epsilon 防止除以零
+    x = x * scalar
+
+    # 第二步：基于高能量部分的 RMS 的精细调整
+    pow_x = x**2
+    avg_pow_x = torch.mean(pow_x)
+    # 选择功率大于平均功率的部分
+    gt_avg_pow_x = pow_x[pow_x > avg_pow_x]
+
+    # 如果没有大于平均功率的部分（例如，在静音音频中），则跳过第二步
+    if gt_avg_pow_x.numel() > 0:
+        rmsx = torch.mean(gt_avg_pow_x) ** 0.5
+        scalarx = 10 ** (-25 / 20) / (rmsx + 1e-8)  # 增加一个小的 epsilon 防止除以零
+        x = x * scalarx
+
+    return x
+
 
 def tensor_to_wav_bytes(
     waveform: torch.Tensor, sample_rate: int, clamp: bool = True
@@ -82,12 +105,12 @@ def ans_read_audio(apath: str |Path | tuple[torch.Tensor|np.ndarray, int])->str|
         wavform = wavform.unsqueeze(0)
 
     if wavform.shape[0] > 1:
-        waveform = wavform.mean(dim=0, keepdim=True)
+        wavform = wavform.mean(dim=0, keepdim=True)
 
     target_sr = 16000
     if sr != target_sr:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
-        waveform = resampler(waveform)
+        wavform = resampler(wavform)
         sr = target_sr
 
     return tensor_to_wav_bytes(wavform, sr, clamp=False)
